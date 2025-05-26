@@ -4,7 +4,7 @@ import os
 import matplotlib
 import matplotlib.pylab as plt
 import torch
-from torch.nn.utils import weight_norm
+from modules.musa_weight_norm import weight_norm
 
 matplotlib.use("Agg")
 

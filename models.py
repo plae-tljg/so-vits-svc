@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import Conv1d, Conv2d
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm, weight_norm
+from torch.nn.utils import spectral_norm
 
 import modules.attentions as attentions
 import modules.commons as commons
@@ -10,6 +10,7 @@ import modules.modules as modules
 import utils
 from modules.commons import get_padding
 from utils import f0_to_coarse
+from modules.musa_weight_norm import weight_norm, remove_weight_norm, WeightNormConv1d, WeightNormConv2d, WeightNormLinear
 
 
 class ResidualCouplingBlock(nn.Module):
@@ -178,6 +179,11 @@ class DiscriminatorP(torch.nn.Module):
         self.conv_post = norm_f(Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
 
     def forward(self, x):
+        # 添加输入检查
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("Warning: Input contains NaN or Inf values")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         fmap = []
 
         # 1d to 2d
@@ -214,6 +220,11 @@ class DiscriminatorS(torch.nn.Module):
         self.conv_post = norm_f(Conv1d(1024, 1, 3, 1, padding=1))
 
     def forward(self, x):
+        # 添加输入检查
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("Warning: Input contains NaN or Inf values")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         fmap = []
 
         for l in self.convs:
@@ -237,11 +248,19 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         self.discriminators = nn.ModuleList(discs)
 
     def forward(self, y, y_hat):
+        # 添加输入检查
+        if torch.isnan(y).any() or torch.isinf(y).any():
+            print("Warning: Real input contains NaN or Inf values")
+            y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(y_hat).any() or torch.isinf(y_hat).any():
+            print("Warning: Generated input contains NaN or Inf values")
+            y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         y_d_rs = []
         y_d_gs = []
         fmap_rs = []
         fmap_gs = []
-        for i, d in enumerate(self.discriminators):
+        for d in self.discriminators:
             y_d_r, fmap_r = d(y)
             y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)

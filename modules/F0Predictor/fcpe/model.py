@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import weight_norm
+from modules.musa_weight_norm import weight_norm
 from torchaudio.transforms import Resample
 
 from .nvSTFT import STFT
