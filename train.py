@@ -118,45 +118,121 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
     half_type = torch.bfloat16 if hps.train.half_type=="bf16" else torch.float16
     global global_step
 
-    # 添加错误计数器和设备状态跟踪
+    # 修改错误处理参数
     error_count = 0
-    max_errors_per_epoch = 100
+    max_errors_per_epoch = 50
     consecutive_errors = 0
-    max_consecutive_errors = 20
-    device_status = "musa"  # 跟踪当前设备状态
-    current_device = device  # 保存初始设备
-    gpu_error_count = 0  # 跟踪GPU错误次数
-    max_gpu_errors_before_fallback = 50  # GPU错误阈值
+    max_consecutive_errors = 10
+    device_status = "cpu"  # 默认使用CPU
+    current_device = torch.device("cpu")
+    gpu_error_count = 0
+    max_gpu_errors_before_fallback = 5
+    recovery_attempts = 0
+    max_recovery_attempts = 3
 
-    # 确保模型在GPU上
+    def save_checkpoint_safe():
+        """安全地保存检查点，确保在CPU上操作"""
+        try:
+            # 将模型移动到CPU
+            net_g_cpu = net_g.cpu()
+            net_d_cpu = net_d.cpu()
+            
+            # 保存检查点
+            utils.save_checkpoint(net_g_cpu, optim_g, hps.train.learning_rate, epoch,
+                                os.path.join(hps.model_dir, f"G_{global_step}_recovery.pth"))
+            utils.save_checkpoint(net_d_cpu, optim_d, hps.train.learning_rate, epoch,
+                                os.path.join(hps.model_dir, f"D_{global_step}_recovery.pth"))
+            
+            # 如果之前是GPU模式，尝试移回GPU
+            if device_status == "musa" and torch_musa.is_available():
+                try:
+                    net_g.to(device)
+                    net_d.to(device)
+                except RuntimeError:
+                    print("Warning: Failed to move models back to MUSA after saving")
+            
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to save checkpoint: {str(e)}")
+            return False
+
+    def recover_from_error():
+        """从错误中恢复"""
+        nonlocal recovery_attempts, consecutive_errors, error_count, device_status, current_device
+        
+        print(f"Attempting recovery (attempt {recovery_attempts + 1}/{max_recovery_attempts})...")
+        
+        # 保存当前状态
+        if save_checkpoint_safe():
+            print("Successfully saved recovery checkpoint")
+        
+        # 清理GPU内存
+        if torch_musa.is_available():
+            try:
+                torch_musa.empty_cache()
+            except:
+                pass
+        
+        # 重置模型到CPU
+        try:
+            net_g.to(torch.device("cpu"))
+            net_d.to(torch.device("cpu"))
+            current_device = torch.device("cpu")
+            device_status = "cpu"
+            
+            # 重置优化器状态
+            optim_g.zero_grad()
+            optim_d.zero_grad()
+            
+            # 重置错误计数
+            consecutive_errors = 0
+            error_count = 0
+            gpu_error_count = 0
+            
+            recovery_attempts += 1
+            return True
+        except Exception as e:
+            print(f"Warning: Recovery failed: {str(e)}")
+            return False
+
+    # 初始化模型
     try:
         net_g.to(current_device)
         net_d.to(current_device)
-        print("Models successfully loaded to MUSA device")
-    except RuntimeError as e:
-        print(f"Warning: Failed to load models to MUSA: {str(e)}")
-        current_device = torch.device("cpu")
-        device_status = "cpu"
-        net_g.to(current_device)
-        net_d.to(current_device)
+        print("Models loaded to CPU first")
+        
+        if torch_musa.is_available():
+            try:
+                net_g.to(device)
+                net_d.to(device)
+                current_device = device
+                device_status = "musa"
+                print("Models successfully moved to MUSA device")
+            except RuntimeError as e:
+                print(f"Warning: Failed to move models to MUSA: {str(e)}")
+                print("Staying on CPU")
+    except Exception as e:
+        print(f"Warning: Error during device initialization: {str(e)}")
+        print("Staying on CPU")
 
     net_g.train()
     net_d.train()
 
     def reset_device_status():
-        """重置所有模型到指定设备"""
+        """重置设备状态，但更保守的策略"""
         nonlocal device_status, current_device, gpu_error_count
         if device_status == "cpu" and gpu_error_count < max_gpu_errors_before_fallback:
             try:
-                print("Attempting to move models back to MUSA...")
-                net_g.to(device)
-                net_d.to(device)
-                current_device = device
-                device_status = "musa"
-                gpu_error_count = 0  # 重置GPU错误计数
-                print("Successfully reset models to MUSA device")
+                if torch_musa.is_available():
+                    print("Attempting to move models to MUSA...")
+                    net_g.to(device)
+                    net_d.to(device)
+                    current_device = device
+                    device_status = "musa"
+                    gpu_error_count = 0
+                    print("Successfully moved models to MUSA device")
             except RuntimeError as e:
-                print(f"Warning: Failed to reset to MUSA: {str(e)}")
+                print(f"Warning: Failed to move to MUSA: {str(e)}")
                 gpu_error_count += 1
                 if gpu_error_count >= max_gpu_errors_before_fallback:
                     print("Too many GPU errors, staying on CPU")
@@ -166,16 +242,16 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
                     device_status = "cpu"
 
     def safe_to_device(tensor, target_device):
-        """安全地将张量转移到目标设备"""
+        """更安全的设备转移策略"""
         nonlocal device_status, current_device, gpu_error_count
         if tensor.device == target_device:
             return tensor
             
         try:
-            # 优先尝试GPU
+            # 如果目标设备是MUSA且错误次数未超限
             if target_device.type == "musa" and gpu_error_count < max_gpu_errors_before_fallback:
                 try:
-                    return tensor.to(target_device, non_blocking=True)  # 启用异步传输
+                    return tensor.to(target_device, non_blocking=False)  # 禁用异步传输
                 except RuntimeError as e:
                     if "MUSA error" in str(e):
                         print(f"Warning: MUSA transfer failed: {str(e)}")
@@ -186,18 +262,11 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
                             current_device = torch.device("cpu")
                         return tensor.cpu()
                     raise e
-            # CPU回退
-            else:
-                return tensor.cpu()
+            # 默认使用CPU
+            return tensor.cpu()
         except Exception as e:
             print(f"Warning: Error in tensor transfer: {str(e)}")
-            if "MUSA error" in str(e):
-                gpu_error_count += 1
-                if gpu_error_count >= max_gpu_errors_before_fallback:
-                    device_status = "cpu"
-                    current_device = torch.device("cpu")
-                return tensor.cpu()
-            raise e
+            return tensor.cpu()
 
     def ensure_same_device(tensors):
         """确保所有张量在同一设备上"""
@@ -210,39 +279,46 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
             target_device = torch.device("cpu")
         return [safe_to_device(t, target_device) for t in tensors]
 
-    # 设置数据加载器
-    train_loader = DataLoader(
-        train_loader.dataset,
-        batch_size=hps.train.batch_size,
-        shuffle=True,
-        num_workers=4,  # 增加工作进程数
-        pin_memory=True,  # 启用内存固定
-        persistent_workers=True  # 保持工作进程存活
-    )
-
     for batch_idx, items in enumerate(train_loader):
         try:
+            # 检查是否需要恢复
+            if consecutive_errors >= max_consecutive_errors:
+                if recovery_attempts >= max_recovery_attempts:
+                    print("Too many recovery attempts, stopping training")
+                    return
+                if not recover_from_error():
+                    print("Recovery failed, stopping training")
+                    return
+                continue
+
             # 每100个batch尝试重置到GPU
-            if batch_idx % 100 == 0:
-                reset_device_status()
-                
+            if batch_idx % 100 == 0 and device_status == "cpu" and torch_musa.is_available():
+                try:
+                    net_g.to(device)
+                    net_d.to(device)
+                    current_device = device
+                    device_status = "musa"
+                    print("Successfully moved models back to MUSA")
+                except RuntimeError:
+                    print("Failed to move models back to MUSA, staying on CPU")
+
+            # 处理数据
             c, f0, spec, y, spk, lengths, uv, volume = items
             
             # 批量转移到设备
             tensors_to_transfer = [c, f0, spec, y, spk, lengths, uv]
             if volume is not None:
                 tensors_to_transfer.append(volume)
-                
-            # 使用异步传输
-            with torch.cuda.stream(torch.cuda.Stream()):
+            
+            try:
                 c, f0, spec, y, spk, lengths, uv, *volume_list = ensure_same_device(tensors_to_transfer)
                 volume = volume_list[0] if volume_list else None
-                
-                # 确保所有张量在同一设备上
-                current_device = c.device
-                g = safe_to_device(spk, current_device)
-            
-            # 数值检查函数
+            except RuntimeError as e:
+                print(f"Warning: Error during tensor transfer: {str(e)}")
+                consecutive_errors += 1
+                continue
+
+            # 数值检查
             def check_and_fix_tensor(tensor, name, min_val=-1e4, max_val=1e4):
                 if tensor is None:
                     return None
@@ -261,107 +337,63 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
             if volume is not None:
                 volume = check_and_fix_tensor(volume, "volume")
 
+            # 训练步骤
             try:
-                # 使用异步计算
-                with torch.cuda.stream(torch.cuda.Stream()):
-                    mel = spec_to_mel_torch(
-                        spec,
-                        hps.data.filter_length,
-                        hps.data.n_mel_channels,
-                        hps.data.sampling_rate,
-                        hps.data.mel_fmin,
-                        hps.data.mel_fmax)
-                
                 with autocast(enabled=hps.train.fp16_run, dtype=half_type):
                     # 确保模型在当前设备上
                     if next(net_g.parameters()).device != current_device:
                         net_g.to(current_device)
                     if next(net_d.parameters()).device != current_device:
                         net_d.to(current_device)
+                    
+                    # 前向传播
+                    y_hat, ids_slice, z_mask, \
+                    (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0 = net_g(c, f0, uv, spec, g=spk, 
+                                                                                        c_lengths=lengths,
+                                                                                        spec_lengths=lengths, 
+                                                                                        vol=volume)
+                    
+                    # 检查生成器输出
+                    y_hat = check_and_fix_tensor(y_hat, "y_hat")
+                    
+                    # 计算损失
+                    mel = spec_to_mel_torch(spec, hps.data.filter_length, hps.data.n_mel_channels,
+                                          hps.data.sampling_rate, hps.data.mel_fmin, hps.data.mel_fmax)
+                    
+                    y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
+                    y_hat_mel = mel_spectrogram_torch(y_hat.squeeze(1), hps.data.filter_length,
+                                                    hps.data.n_mel_channels, hps.data.sampling_rate,
+                                                    hps.data.hop_length, hps.data.win_length,
+                                                    hps.data.mel_fmin, hps.data.mel_fmax)
+                    
+                    y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size)
+                    
+                    # 确保所有张量在同一设备上
+                    y_mel, y_hat_mel, y, y_hat = ensure_same_device([y_mel, y_hat_mel, y, y_hat])
+                    
+                    # 判别器前向传播
+                    y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+                    
+                    # 计算损失
+                    with autocast(enabled=False, dtype=half_type):
+                        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
+                        loss_disc_all = loss_disc * 0.25
                         
-                    # 使用异步计算
-                    with torch.cuda.stream(torch.cuda.Stream()):
-                        y_hat, ids_slice, z_mask, \
-                        (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0 = net_g(c, f0, uv, spec, g=g, c_lengths=lengths,
-                                                                                            spec_lengths=lengths, vol=volume)
-
-                        # 检查生成器输出
-                        y_hat = check_and_fix_tensor(y_hat, "y_hat")
-
-                        y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
-                        y_hat_mel = mel_spectrogram_torch(
-                            y_hat.squeeze(1),
-                            hps.data.filter_length,
-                            hps.data.n_mel_channels,
-                            hps.data.sampling_rate,
-                            hps.data.hop_length,
-                            hps.data.win_length,
-                            hps.data.mel_fmin,
-                            hps.data.mel_fmax
-                        )
-                        y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size)
-
-                        # 确保所有张量在同一设备上
-                        y_mel, y_hat_mel, y, y_hat = ensure_same_device([y_mel, y_hat_mel, y, y_hat])
-
-                        # Discriminator
-                        y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-
-                        with autocast(enabled=False, dtype=half_type):
-                            # 判别器损失
-                            loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
-                            loss_disc_all = loss_disc * 0.25
-                            
-                            # 检查判别器损失
-                            if torch.isnan(loss_disc_all) or torch.isinf(loss_disc_all):
-                                print(f"Warning: Discriminator loss is NaN/Inf, using fallback value")
-                                loss_disc_all = torch.tensor(0.1, device=current_device)
-            
-            except RuntimeError as e:
-                if "MUSA error" in str(e) or "Index should be on GPU device" in str(e):
-                    print(f"Warning: Device error in forward pass: {str(e)}")
-                    gpu_error_count += 1
-                    if gpu_error_count >= max_gpu_errors_before_fallback:
-                        print("Too many GPU errors, switching to CPU")
-                        device_status = "cpu"
-                        current_device = torch.device("cpu")
-                        net_g.to(current_device)
-                        net_d.to(current_device)
-                    error_count += 1
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        print("Too many consecutive errors, saving checkpoint and resetting...")
-                        try:
-                            # 保存前确保模型在CPU上
-                            net_g_cpu = net_g.cpu()
-                            net_d_cpu = net_d.cpu()
-                            utils.save_checkpoint(net_g_cpu, optim_g, hps.train.learning_rate, epoch,
-                                                os.path.join(hps.model_dir, f"G_{global_step}_error.pth"))
-                            utils.save_checkpoint(net_d_cpu, optim_d, hps.train.learning_rate, epoch,
-                                                os.path.join(hps.model_dir, f"D_{global_step}_error.pth"))
-                            # 重置设备状态
-                            reset_device_status()
-                            consecutive_errors = 0
-                        except Exception as save_error:
-                            print(f"Warning: Failed to save checkpoint: {str(save_error)}")
-                    continue
-                raise e
-
-            # 判别器更新
-            try:
+                        if torch.isnan(loss_disc_all) or torch.isinf(loss_disc_all):
+                            print("Warning: Discriminator loss is NaN/Inf, using fallback value")
+                            loss_disc_all = torch.tensor(0.1, device=current_device)
+                
+                # 判别器更新
                 optim_d.zero_grad()
                 scaler.scale(loss_disc_all).backward()
-                
-                # 梯度裁剪
                 scaler.unscale_(optim_d)
                 grad_norm_d = commons.clip_grad_value_(net_d.parameters(), 0.5)
                 scaler.step(optim_d)
                 
+                # 生成器更新
                 with autocast(enabled=hps.train.fp16_run, dtype=half_type):
-                    # Generator
                     y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
                     with autocast(enabled=False, dtype=half_type):
-                        # 生成器损失
                         loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                         loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                         loss_fm = feature_loss(fmap_r, fmap_g) * 0.25
@@ -377,27 +409,24 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
                         
                         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_lf0
                         
-                        # 检查生成器损失
                         if torch.isnan(loss_gen_all) or torch.isinf(loss_gen_all):
-                            print(f"Warning: Generator loss is NaN/Inf, using fallback value")
+                            print("Warning: Generator loss is NaN/Inf, using fallback value")
                             loss_gen_all = torch.tensor(0.1, device=current_device)
                 
-                # 生成器更新
                 optim_g.zero_grad()
                 scaler.scale(loss_gen_all).backward()
-                
-                # 梯度裁剪
                 scaler.unscale_(optim_g)
                 grad_norm_g = commons.clip_grad_value_(net_g.parameters(), 0.5)
                 scaler.step(optim_g)
                 scaler.update()
-
-                # 重置连续错误计数
+                
+                # 重置错误计数
                 consecutive_errors = 0
-
+                error_count = 0
+                
             except RuntimeError as e:
                 if "MUSA error" in str(e) or "Index should be on GPU device" in str(e):
-                    print(f"Warning: Device error in backward pass: {str(e)}")
+                    print(f"Warning: Device error in training step: {str(e)}")
                     gpu_error_count += 1
                     if gpu_error_count >= max_gpu_errors_before_fallback:
                         print("Too many GPU errors, switching to CPU")
@@ -407,30 +436,10 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
                         net_d.to(current_device)
                     error_count += 1
                     consecutive_errors += 1
-                    # 清理梯度
-                    optim_g.zero_grad()
-                    optim_d.zero_grad()
                     continue
                 raise e
 
-            # 检查错误计数
-            if error_count >= max_errors_per_epoch:
-                print(f"Warning: Too many errors in this epoch ({error_count}), saving checkpoint and continuing...")
-                try:
-                    # 保存前确保模型在CPU上
-                    net_g_cpu = net_g.cpu()
-                    net_d_cpu = net_d.cpu()
-                    utils.save_checkpoint(net_g_cpu, optim_g, hps.train.learning_rate, epoch,
-                                        os.path.join(hps.model_dir, f"G_{global_step}_error.pth"))
-                    utils.save_checkpoint(net_d_cpu, optim_d, hps.train.learning_rate, epoch,
-                                        os.path.join(hps.model_dir, f"D_{global_step}_error.pth"))
-                    # 重置设备状态
-                    reset_device_status()
-                    error_count = 0
-                except Exception as save_error:
-                    print(f"Warning: Failed to save checkpoint: {str(save_error)}")
-                continue
-
+            # 记录训练状态
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]['lr']
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
@@ -440,10 +449,11 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
                     100. * batch_idx / len(train_loader)))
                 logger.info(f"Losses: {[x.item() for x in losses]}, step: {global_step}, lr: {lr}, reference_loss: {reference_loss}")
 
+                # 记录到tensorboard
                 scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr,
-                               "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
+                             "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
                 scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/kl": loss_kl,
-                                    "loss/g/lf0": loss_lf0})
+                                  "loss/g/lf0": loss_lf0})
 
                 image_dict = {
                     "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
@@ -464,12 +474,11 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
                     scalars=scalar_dict
                 )
 
+            # 保存检查点
             if global_step % hps.train.eval_interval == 0:
                 evaluate(hps, net_g, eval_loader, writer_eval)
-                utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch,
-                                      os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
-                utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch,
-                                      os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
+                if save_checkpoint_safe():
+                    print(f"Successfully saved checkpoint at step {global_step}")
                 keep_ckpts = getattr(hps.train, 'keep_ckpts', 0)
                 if keep_ckpts > 0:
                     utils.clean_checkpoints(path_to_models=hps.model_dir, n_ckpts_to_keep=keep_ckpts, sort_by_time=True)
@@ -481,20 +490,9 @@ def train_and_evaluate(device, epoch, hps, nets, optims, schedulers, scaler, loa
             error_count += 1
             consecutive_errors += 1
             if consecutive_errors >= max_consecutive_errors:
-                print("Too many consecutive errors, saving checkpoint and resetting...")
-                try:
-                    # 保存前确保模型在CPU上
-                    net_g_cpu = net_g.cpu()
-                    net_d_cpu = net_d.cpu()
-                    utils.save_checkpoint(net_g_cpu, optim_g, hps.train.learning_rate, epoch,
-                                        os.path.join(hps.model_dir, f"G_{global_step}_error.pth"))
-                    utils.save_checkpoint(net_d_cpu, optim_d, hps.train.learning_rate, epoch,
-                                        os.path.join(hps.model_dir, f"D_{global_step}_error.pth"))
-                    # 重置设备状态
-                    reset_device_status()
-                    consecutive_errors = 0
-                except Exception as save_error:
-                    print(f"Warning: Failed to save checkpoint: {str(save_error)}")
+                if not recover_from_error():
+                    print("Recovery failed, stopping training")
+                    return
             continue
 
     if global_step % hps.train.eval_interval == 0:

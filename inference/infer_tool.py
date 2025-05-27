@@ -14,6 +14,7 @@ import numpy as np
 # import onnxruntime
 import soundfile
 import torch
+import torch_musa
 import torchaudio
 
 import cluster
