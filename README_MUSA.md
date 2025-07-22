@@ -1,0 +1,1 @@
+This codes is the previous adaptation of sovits-svc to mthreads gpu, seems like not work on training part due to weight norm issue. But since inference dotn use weiight norm, should not has problem.  
