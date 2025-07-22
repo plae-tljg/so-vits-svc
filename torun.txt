@@ -1,0 +1,5 @@
+conda env list  #use conda for ffmpeg
+conda activate test_sovits_svc_env
+python train.py -c configs/config.json -m 44k
+python inference_main.py    #remember change checkpoint name
+watch -n .5 mthreads-gmi

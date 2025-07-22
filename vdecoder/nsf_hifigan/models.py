@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import AvgPool1d, Conv1d, Conv2d, ConvTranspose1d
-from modules.musa_weight_norm import weight_norm, remove_weight_norm
+from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
 from .env import AttrDict
 from .utils import get_padding, init_weights
@@ -14,7 +14,7 @@ from .utils import get_padding, init_weights
 LRELU_SLOPE = 0.1
 
 
-def load_model(model_path, device='musa'):
+def load_model(model_path, device='cuda'):
     h = load_config(model_path)
 
     generator = Generator(h).to(device)

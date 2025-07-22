@@ -1,10 +1,19 @@
+import os
+os.environ["PYTORCH_ENABLE_MUSA_FLASH_ATTENTION"] = "0"
+os.environ["PYTORCH_ENABLE_FLASH_ATTENTION"] = "0"
+os.environ["PYTORCH_MUSA_FLASH_ATTENTION"] = "0"
+os.environ["ENABLE_MUSA_FLASH_ATTENTION"] = "0"
+os.environ["ENABLE_FLASH_ATTENTION"] = "0"
+
 import logging
-import torch_musa
+
 import soundfile
 
 from inference import infer_tool
 from inference.infer_tool import Svc
 from spkmix import spk_mix_map
+import torch
+import torch_musa
 
 logging.getLogger('numba').setLevel(logging.WARNING)
 chunks_dict = infer_tool.read_temp("inference/chunks_temp.json")
@@ -15,15 +24,17 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='sovits4 inference')
-
+    # python inference_main.py -m "logs/44k/G_30400.pth" -c "configs/config.json" -n "君の知らない物語-src.wav" -t 0 -s "nen"
     # 一定要设置的部分
-    # parser.add_argument('-m', '--model_path', type=str, default="logs/44k/G_47200.pth", help='模型路径')
-    parser.add_argument('-m', '--model_path', type=str, default="logs/44k/G_0.pth", help='模型路径')
+    parser.add_argument('-m', '--model_path', type=str, default="logs/44k/G_25000.pth", help='模型路径')
     parser.add_argument('-c', '--config_path', type=str, default="logs/44k/config.json", help='配置文件路径')
     parser.add_argument('-cl', '--clip', type=float, default=0, help='音频强制切片，默认0为自动切片，单位为秒/s')
     parser.add_argument('-n', '--clean_names', type=str, nargs='+', default=["imprisoned_xii.wav"], help='wav文件名列表，放在raw文件夹下')
-    parser.add_argument('-t', '--trans', type=int, nargs='+', default=[0], help='音高调整，支持正负（半音）')
-    parser.add_argument('-s', '--spk_list', type=str, nargs='+', default=['theresa'], help='合成目标说话人名称')
+    # parser.add_argument('-n', '--clean_names', type=str, nargs='+', default=["君の知らない物語-src.wav"], help='wav文件名列表，放在raw文件夹下')
+    parser.add_argument('-t', '--trans', type=int, nargs='+', default=[2], help='音高调整，支持正负（半音）')
+    # parser.add_argument('-t', '--trans', type=int, nargs='+', default=[0], help='音高调整，支持正负（半音）')
+    parser.add_argument('-s', '--spk_list', type=str, nargs='+', default=['theresa01'], help='合成目标说话人名称')
+    # parser.add_argument('-s', '--spk_list', type=str, nargs='+', default=['buyizi'], help='合成目标说话人名称')
     
     # 可选项部分
     parser.add_argument('-a', '--auto_predict_f0', action='store_true', default=False, help='语音转换自动预测音高，转换歌声时不要打开这个会严重跑调')
@@ -32,8 +43,7 @@ def main():
     parser.add_argument('-lg', '--linear_gradient', type=float, default=0, help='两段音频切片的交叉淡入长度，如果强制切片后出现人声不连贯可调整该数值，如果连贯建议采用默认值0，单位为秒')
     parser.add_argument('-f0p', '--f0_predictor', type=str, default="pm", help='选择F0预测器,可选择crepe,pm,dio,harvest,rmvpe,fcpe默认为pm(注意：crepe为原F0使用均值滤波器)')
     parser.add_argument('-eh', '--enhance', action='store_true', default=False, help='是否使用NSF_HIFIGAN增强器,该选项对部分训练集少的模型有一定的音质增强效果，但是对训练好的模型有反面效果，默认关闭')
-    # parser.add_argument('-shd', '--shallow_diffusion', action='store_true', default=False, help='是否使用浅层扩散，使用后可解决一部分电音问题，默认关闭，该选项打开时，NSF_HIFIGAN增强器将会被禁止')
-    parser.add_argument('-shd', '--shallow_diffusion', action='store_true', default=True, help='是否使用浅层扩散，使用后可解决一部分电音问题，默认关闭，该选项打开时，NSF_HIFIGAN增强器将会被禁止')
+    parser.add_argument('-shd', '--shallow_diffusion', action='store_true', default=False, help='是否使用浅层扩散，使用后可解决一部分电音问题，默认关闭，该选项打开时，NSF_HIFIGAN增强器将会被禁止')
     parser.add_argument('-usm', '--use_spk_mix', action='store_true', default=False, help='是否使用角色融合')
     parser.add_argument('-lea', '--loudness_envelope_adjustment', type=float, default=1, help='输入源响度包络替换输出响度包络融合比例，越靠近1越使用输出响度包络')
     parser.add_argument('-fr', '--feature_retrieval', action='store_true', default=False, help='是否使用特征检索，如果使用聚类模型将被禁用，且cm与cr参数将会变成特征检索的索引路径与混合比例')
@@ -93,9 +103,19 @@ def main():
     else:  # 若未指定占比，则无论是否指定模型路径，都将其置空以避免之后的模型加载
         args.cluster_model_path = ""
 
+    if args.device is None:
+        if torch_musa.is_available():
+            device = "musa"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+
     svc_model = Svc(args.model_path,
                     args.config_path,
-                    args.device,
+                    device,
                     args.cluster_model_path,
                     enhance,
                     diffusion_model_path,

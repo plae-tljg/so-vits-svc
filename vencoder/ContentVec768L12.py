@@ -28,10 +28,10 @@ class ContentVec768L12(SpeechEncoder):
         feats = feats.view(1, -1)
         padding_mask = torch.BoolTensor(feats.shape).fill_(False)
         inputs = {
-          "source": feats.to(wav.device),
-          "padding_mask": padding_mask.to(wav.device),
+          "source": feats.cpu(),  # 强制送到CPU
+          "padding_mask": padding_mask.cpu(),
           "output_layer": 12,  # layer 12
         }
         with torch.no_grad():
-            logits = self.model.extract_features(**inputs)
-        return logits[0].transpose(1, 2)
+            logits = self.model.cpu().extract_features(**inputs)  # 保证模型在CPU
+        return logits[0].transpose(1, 2).to(self.dev)  # 关键：转回主设备

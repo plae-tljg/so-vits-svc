@@ -1,7 +1,3 @@
-**Using MUSA+SDK-MUSA+SDK+rc3.1.0+, PYTHON 3.10, torch_musa-1.3.0-cp310-cp310-linux_x86_64**  
-
-
-
 <div align="center">
 <img alt="LOGO" src="https://avatars.githubusercontent.com/u/127122328?s=400&u=5395a98a4f945a3a50cb0cc96c2747505d190dbc&v=4" width="300" height="300" />
 

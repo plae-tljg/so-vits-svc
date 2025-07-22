@@ -1,2 +1,2 @@
-./dataset/44k/theresa/merged_000.wav
-./dataset/44k/theresa/merged_031.wav
+./dataset/44k/theresa01/ex_cn_406.wav
+./dataset/44k/theresa01/ex_cn_202.wav

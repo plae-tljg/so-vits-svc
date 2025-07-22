@@ -4,7 +4,7 @@ import os
 # matplotlib.use("Agg")
 import matplotlib.pylab as plt
 import torch
-from modules.musa_weight_norm import weight_norm, WeightNormConv1d, WeightNormConv2d, WeightNormLinear, WeightNormConvTranspose1d
+from torch.nn.utils import weight_norm
 
 
 def plot_spectrogram(spectrogram):
@@ -22,18 +22,13 @@ def plot_spectrogram(spectrogram):
 def init_weights(m, mean=0.0, std=0.01):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
-        if hasattr(m, 'weight_v'):  # WeightNormConv1d
-            m.weight_v.data.normal_(mean, std)
-            m.weight_g.data.fill_(1.0)
-        else:  # Regular Conv
-            m.weight.data.normal_(mean, std)
+        m.weight.data.normal_(mean, std)
 
 
 def apply_weight_norm(m):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
-        if not isinstance(m, (WeightNormConv1d, WeightNormConv2d, WeightNormLinear, WeightNormConvTranspose1d)):
-            weight_norm(m)
+        weight_norm(m)
 
 
 def get_padding(kernel_size, dilation=1):

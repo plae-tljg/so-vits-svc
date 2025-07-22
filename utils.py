@@ -43,7 +43,7 @@ def normalize_f0(f0, x_mask, uv, random_scale=True):
     if torch.isnan(f0_norm).any():
         exit(0)
     return f0_norm * x_mask
-def plot_data_to_numpy(x, y=None):
+def plot_data_to_numpy(x, y):
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
         import matplotlib
@@ -55,18 +55,15 @@ def plot_data_to_numpy(x, y=None):
     import numpy as np
 
     fig, ax = plt.subplots(figsize=(10, 2))
-    if y is None:
-        plt.plot(x)
-    else:
-        plt.plot(x)
-        plt.plot(y)
+    plt.plot(x)
+    plt.plot(y)
     plt.tight_layout()
 
     fig.canvas.draw()
-    buf = fig.canvas.buffer_rgba()
-    data = np.asarray(buf)
+    data = np.asarray(fig.canvas.buffer_rgba())
+    data = data[:, :, :3]
     plt.close()
-    return data[:,:,:3]  # 只返回 RGB 通道
+    return data
 
 
 def f0_to_coarse(f0):
@@ -163,20 +160,6 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
     if optimizer is not None and not skip_optimizer and checkpoint_dict['optimizer'] is not None:
         optimizer.load_state_dict(checkpoint_dict['optimizer'])
     saved_state_dict = checkpoint_dict['model']
-    
-    # 添加权重检查
-    print(f"\nChecking weights in {checkpoint_path}:")
-    for k, v in saved_state_dict.items():
-        if torch.isnan(v).any() or torch.isinf(v).any():
-            print(f"Warning: {k} contains NaN/Inf")
-            print(f"Shape: {v.shape}")
-            print(f"NaN count: {torch.isnan(v).sum().item()}")
-            print(f"Inf count: {torch.isinf(v).sum().item()}")
-            print(f"Min value: {v.min().item()}")
-            print(f"Max value: {v.max().item()}")
-            print(f"Mean value: {v.mean().item()}")
-            print("---")
-    
     model = model.to(list(saved_state_dict.values())[0].dtype)
     if hasattr(model, 'module'):
         state_dict = model.module.state_dict()
@@ -280,10 +263,10 @@ def plot_spectrogram_to_numpy(spectrogram):
   plt.tight_layout()
 
   fig.canvas.draw()
-  buf = fig.canvas.buffer_rgba()
-  data = np.asarray(buf)
+  data = np.asarray(fig.canvas.buffer_rgba())
+  data = data[:, :, :3]
   plt.close()
-  return data[:,:,:3]
+  return data
 
 
 def plot_alignment_to_numpy(alignment, info=None):
@@ -309,8 +292,8 @@ def plot_alignment_to_numpy(alignment, info=None):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+  data = np.asarray(fig.canvas.buffer_rgba())
+  data = data[:, :, :3]
   plt.close()
   return data
 
