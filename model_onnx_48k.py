@@ -115,7 +115,7 @@ class TextEncoder(nn.Module):
   def forward(self, x, x_lengths, f0=None):
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
     x = self.pre(x) * x_mask
-    x = x + self.f0_emb(f0).transpose(1,2)
+    x = x + self.f0_emb(f0.long()).transpose(1,2)
     x = self.enc_(x * x_mask, x_mask)
     stats = self.proj(x) * x_mask
     m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -305,7 +305,7 @@ class SynthesizerTrn(nn.Module):
 
     self.enc_p_ = TextEncoder(ssl_dim, inter_channels, hidden_channels, 5, 1, 16,0, filter_channels, n_heads, p_dropout)
     hps = {
-        "sampling_rate": 32000,
+        "sampling_rate": 48000,
         "inter_channels": 192,
         "resblock": "1",
         "resblock_kernel_sizes": [3, 7, 11],
@@ -319,33 +319,10 @@ class SynthesizerTrn(nn.Module):
     self.enc_q = Encoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
     self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
 
-  def forward(self, c, f0, spec, g=None, mel=None, c_lengths=None, spec_lengths=None):
-    if c_lengths == None:
-      c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
-    if spec_lengths == None:
-      spec_lengths = (torch.ones(spec.size(0)) * spec.size(-1)).to(spec.device)
-
-    g = self.emb_g(g).transpose(1,2)
-
-    z_ptemp, m_p, logs_p, _ = self.enc_p_(c, c_lengths, f0=f0_to_coarse(f0))
-    z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g) 
-
-    z_p = self.flow(z, spec_mask, g=g)
-    z_slice, pitch_slice, ids_slice = commons.rand_slice_segments_with_pitch(z, f0, spec_lengths, self.segment_size)
-
-    # o = self.dec(z_slice, g=g)
-    o = self.dec(z_slice, g=g, f0=pitch_slice)
-
-    return o, ids_slice, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
-
-  def infer(self, c, f0, g=None, mel=None, c_lengths=None):
-    if c_lengths == None:
-      c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
-    g = self.emb_g(g).transpose(1,2)
-
-    z_p, m_p, logs_p, c_mask = self.enc_p_(c, c_lengths, f0=f0_to_coarse(f0))
+  def forward(self, c, c_lengths, f0, g=None):
+    g = self.emb_g(g.unsqueeze(0)).transpose(1,2)
+    z_p, m_p, logs_p, c_mask = self.enc_p_(c.transpose(1,2), c_lengths, f0=f0_to_coarse(f0))
     z = self.flow(z_p, c_mask, g=g, reverse=True)
-
-    o = self.dec(z * c_mask, g=g, f0=f0)
-
+    o = self.dec(z * c_mask, g=g, f0=f0.float())
     return o
+    

@@ -1,25 +1,24 @@
-import argparse
-import glob
-import json
-import logging
 import os
+import glob
 import re
-import subprocess
 import sys
-import traceback
-from multiprocessing import cpu_count
+import argparse
+import logging
+import json
+import subprocess
 
-import faiss
 import librosa
 import numpy as np
-import torch
+import torchaudio
 from scipy.io.wavfile import read
-from sklearn.cluster import MiniBatchKMeans
+import torch
+import torchvision
 from torch.nn import functional as F
-
+from commons import sequence_mask
+from hubert import hubert_model
 MATPLOTLIB_FLAG = False
 
-logging.basicConfig(stream=sys.stdout, level=logging.WARN)
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 logger = logging
 
 f0_bin = 256
@@ -28,59 +27,38 @@ f0_min = 50.0
 f0_mel_min = 1127 * np.log(1 + f0_min / 700)
 f0_mel_max = 1127 * np.log(1 + f0_max / 700)
 
-def normalize_f0(f0, x_mask, uv, random_scale=True):
-    # calculate means based on x_mask
-    uv_sum = torch.sum(uv, dim=1, keepdim=True)
-    uv_sum[uv_sum == 0] = 9999
-    means = torch.sum(f0[:, 0, :] * uv, dim=1, keepdim=True) / uv_sum
-
-    if random_scale:
-        factor = torch.Tensor(f0.shape[0], 1).uniform_(0.8, 1.2).to(f0.device)
-    else:
-        factor = torch.ones(f0.shape[0], 1).to(f0.device)
-    # normalize f0 based on means and factor
-    f0_norm = (f0 - means.unsqueeze(-1)) * factor.unsqueeze(-1)
-    if torch.isnan(f0_norm).any():
-        exit(0)
-    return f0_norm * x_mask
-def plot_data_to_numpy(x, y=None):
-    global MATPLOTLIB_FLAG
-    if not MATPLOTLIB_FLAG:
-        import matplotlib
-        matplotlib.use("Agg")
-        MATPLOTLIB_FLAG = True
-        mpl_logger = logging.getLogger('matplotlib')
-        mpl_logger.setLevel(logging.WARNING)
-    import matplotlib.pylab as plt
-    import numpy as np
-
-    fig, ax = plt.subplots(figsize=(10, 2))
-    if y is None:
-        plt.plot(x)
-    else:
-        plt.plot(x)
-        plt.plot(y)
-    plt.tight_layout()
-
-    fig.canvas.draw()
-    buf = fig.canvas.buffer_rgba()
-    data = np.asarray(buf)
-    plt.close()
-    return data[:,:,:3]  # 只返回 RGB 通道
-
-
 def f0_to_coarse(f0):
-  f0_mel = 1127 * (1 + f0 / 700).log()
-  a = (f0_bin - 2) / (f0_mel_max - f0_mel_min)
-  b = f0_mel_min * a - 1.
-  f0_mel = torch.where(f0_mel > 0, f0_mel * a - b, f0_mel)
-  # torch.clip_(f0_mel, min=1., max=float(f0_bin - 1))
-  f0_coarse = torch.round(f0_mel).long()
-  f0_coarse = f0_coarse * (f0_coarse > 0)
-  f0_coarse = f0_coarse + ((f0_coarse < 1) * 1)
-  f0_coarse = f0_coarse * (f0_coarse < f0_bin)
-  f0_coarse = f0_coarse + ((f0_coarse >= f0_bin) * (f0_bin - 1))
+  is_torch = isinstance(f0, torch.Tensor)
+  f0_mel = 1127 * (1 + f0 / 700).log() if is_torch else 1127 * np.log(1 + f0 / 700)
+  f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * (f0_bin - 2) / (f0_mel_max - f0_mel_min) + 1
+
+  f0_mel[f0_mel <= 1] = 1
+  f0_mel[f0_mel > f0_bin - 1] = f0_bin - 1
+  f0_coarse = (f0_mel + 0.5).long() if is_torch else np.rint(f0_mel).astype(np.int)
+  assert f0_coarse.max() <= 255 and f0_coarse.min() >= 1, (f0_coarse.max(), f0_coarse.min())
   return f0_coarse
+
+
+def get_hubert_model(rank=None):
+
+  hubert_soft = hubert_model.hubert_soft("hubert/hubert-soft-0d54a1f4.pt")
+  if rank is not None:
+    hubert_soft = hubert_soft.cuda(rank)
+  return hubert_soft
+
+def get_hubert_content(hmodel, y=None, path=None):
+  if path is not None:
+    source, sr = torchaudio.load(path)
+    source = torchaudio.functional.resample(source, sr, 16000)
+    if len(source.shape) == 2 and source.shape[1] >= 2:
+      source = torch.mean(source, dim=0).unsqueeze(0)
+  else:
+    source = y
+  source = source.unsqueeze(0)
+  with torch.inference_mode():
+    units = hmodel.units(source)
+    return units.transpose(1,2)
+
 
 def get_content(cmodel, y):
     with torch.no_grad():
@@ -88,120 +66,55 @@ def get_content(cmodel, y):
     c = c.transpose(1, 2)
     return c
 
-def get_f0_predictor(f0_predictor,hop_length,sampling_rate,**kargs):
-    if f0_predictor == "pm":
-        from modules.F0Predictor.PMF0Predictor import PMF0Predictor
-        f0_predictor_object = PMF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate)
-    elif f0_predictor == "crepe":
-        from modules.F0Predictor.CrepeF0Predictor import CrepeF0Predictor
-        f0_predictor_object = CrepeF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,device=kargs["device"],threshold=kargs["threshold"])
-    elif f0_predictor == "harvest":
-        from modules.F0Predictor.HarvestF0Predictor import HarvestF0Predictor
-        f0_predictor_object = HarvestF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate)
-    elif f0_predictor == "dio":
-        from modules.F0Predictor.DioF0Predictor import DioF0Predictor
-        f0_predictor_object = DioF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate) 
-    elif f0_predictor == "rmvpe":
-        from modules.F0Predictor.RMVPEF0Predictor import RMVPEF0Predictor
-        f0_predictor_object = RMVPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float32 ,device=kargs["device"],threshold=kargs["threshold"])
-    elif f0_predictor == "fcpe":
-        from modules.F0Predictor.FCPEF0Predictor import FCPEF0Predictor
-        f0_predictor_object = FCPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float32 ,device=kargs["device"],threshold=kargs["threshold"])
-    else:
-        raise Exception("Unknown f0 predictor")
-    return f0_predictor_object
 
-def get_speech_encoder(speech_encoder,device=None,**kargs):
-    if speech_encoder == "vec768l12":
-        from vencoder.ContentVec768L12 import ContentVec768L12
-        speech_encoder_object = ContentVec768L12(device = device)
-    elif speech_encoder == "vec256l9":
-        from vencoder.ContentVec256L9 import ContentVec256L9
-        speech_encoder_object = ContentVec256L9(device = device)
-    elif speech_encoder == "vec256l9-onnx":
-        from vencoder.ContentVec256L9_Onnx import ContentVec256L9_Onnx
-        speech_encoder_object = ContentVec256L9_Onnx(device = device)
-    elif speech_encoder == "vec256l12-onnx":
-        from vencoder.ContentVec256L12_Onnx import ContentVec256L12_Onnx
-        speech_encoder_object = ContentVec256L12_Onnx(device = device)
-    elif speech_encoder == "vec768l9-onnx":
-        from vencoder.ContentVec768L9_Onnx import ContentVec768L9_Onnx
-        speech_encoder_object = ContentVec768L9_Onnx(device = device)
-    elif speech_encoder == "vec768l12-onnx":
-        from vencoder.ContentVec768L12_Onnx import ContentVec768L12_Onnx
-        speech_encoder_object = ContentVec768L12_Onnx(device = device)
-    elif speech_encoder == "hubertsoft-onnx":
-        from vencoder.HubertSoft_Onnx import HubertSoft_Onnx
-        speech_encoder_object = HubertSoft_Onnx(device = device)
-    elif speech_encoder == "hubertsoft":
-        from vencoder.HubertSoft import HubertSoft
-        speech_encoder_object = HubertSoft(device = device)
-    elif speech_encoder == "whisper-ppg":
-        from vencoder.WhisperPPG import WhisperPPG
-        speech_encoder_object = WhisperPPG(device = device)
-    elif speech_encoder == "cnhubertlarge":
-        from vencoder.CNHubertLarge import CNHubertLarge
-        speech_encoder_object = CNHubertLarge(device = device)
-    elif speech_encoder == "dphubert":
-        from vencoder.DPHubert import DPHubert
-        speech_encoder_object = DPHubert(device = device)
-    elif speech_encoder == "whisper-ppg-large":
-        from vencoder.WhisperPPGLarge import WhisperPPGLarge
-        speech_encoder_object = WhisperPPGLarge(device = device)
-    elif speech_encoder == "wavlmbase+":
-        from vencoder.WavLMBasePlus import WavLMBasePlus
-        speech_encoder_object = WavLMBasePlus(device = device)
-    else:
-        raise Exception("Unknown speech encoder")
-    return speech_encoder_object 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False):
-    assert os.path.isfile(checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-    iteration = checkpoint_dict['iteration']
-    learning_rate = checkpoint_dict['learning_rate']
-    if optimizer is not None and not skip_optimizer and checkpoint_dict['optimizer'] is not None:
-        optimizer.load_state_dict(checkpoint_dict['optimizer'])
-    saved_state_dict = checkpoint_dict['model']
-    
-    # 添加权重检查
-    print(f"\nChecking weights in {checkpoint_path}:")
-    for k, v in saved_state_dict.items():
-        if torch.isnan(v).any() or torch.isinf(v).any():
-            print(f"Warning: {k} contains NaN/Inf")
-            print(f"Shape: {v.shape}")
-            print(f"NaN count: {torch.isnan(v).sum().item()}")
-            print(f"Inf count: {torch.isinf(v).sum().item()}")
-            print(f"Min value: {v.min().item()}")
-            print(f"Max value: {v.max().item()}")
-            print(f"Mean value: {v.mean().item()}")
-            print("---")
-    
-    model = model.to(list(saved_state_dict.values())[0].dtype)
-    if hasattr(model, 'module'):
-        state_dict = model.module.state_dict()
+def transform(mel, height): # 68-92
+    #r = np.random.random()
+    #rate = r * 0.3 + 0.85 # 0.85-1.15
+    #height = int(mel.size(-2) * rate)
+    tgt = torchvision.transforms.functional.resize(mel, (height, mel.size(-1)))
+    if height >= mel.size(-2):
+        return tgt[:, :mel.size(-2), :]
     else:
-        state_dict = model.state_dict()
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        try:
-            # assert "dec" in k or "disc" in k
-            # print("load", k)
-            new_state_dict[k] = saved_state_dict[k]
-            assert saved_state_dict[k].shape == v.shape, (saved_state_dict[k].shape, v.shape)
-        except Exception:
-            if "enc_q" not in k or "emb_g" not in k:
-              print("%s is not in the checkpoint,please check your checkpoint.If you're using pretrain model,just ignore this warning." % k)
-              logger.info("%s is not in the checkpoint" % k)
-              new_state_dict[k] = v
-    if hasattr(model, 'module'):
-        model.module.load_state_dict(new_state_dict)
-    else:
-        model.load_state_dict(new_state_dict)
-    print("load ")
-    logger.info("Loaded checkpoint '{}' (iteration {})".format(
-        checkpoint_path, iteration))
-    return model, optimizer, learning_rate, iteration
+        silence = tgt[:,-1:,:].repeat(1,mel.size(-2)-height,1)
+        silence += torch.randn_like(silence) / 10
+        return torch.cat((tgt, silence), 1)
+
+
+def stretch(mel, width): # 0.5-2
+    return torchvision.transforms.functional.resize(mel, (mel.size(-2), width))
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None):
+  assert os.path.isfile(checkpoint_path)
+  checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+  iteration = checkpoint_dict['iteration']
+  learning_rate = checkpoint_dict['learning_rate']
+  if iteration is None:
+    iteration = 1
+  if learning_rate is None:
+    learning_rate = 0.0002
+  if optimizer is not None and checkpoint_dict['optimizer'] is not None:
+    optimizer.load_state_dict(checkpoint_dict['optimizer'])
+  saved_state_dict = checkpoint_dict['model']
+  if hasattr(model, 'module'):
+    state_dict = model.module.state_dict()
+  else:
+    state_dict = model.state_dict()
+  new_state_dict= {}
+  for k, v in state_dict.items():
+    try:
+      new_state_dict[k] = saved_state_dict[k]
+    except:
+      logger.info("%s is not in the checkpoint" % k)
+      new_state_dict[k] = v
+  if hasattr(model, 'module'):
+    model.module.load_state_dict(new_state_dict)
+  else:
+    model.load_state_dict(new_state_dict)
+  logger.info("Loaded checkpoint '{}' (iteration {})" .format(
+    checkpoint_path, iteration))
+  return model, optimizer, learning_rate, iteration
 
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
@@ -215,8 +128,11 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path)
               'iteration': iteration,
               'optimizer': optimizer.state_dict(),
               'learning_rate': learning_rate}, checkpoint_path)
+  # clean_ckpt = False
+  # if clean_ckpt:
+  #   clean_checkpoints(path_to_models='logs/32k/', n_ckpts_to_keep=3, sort_by_time=True)
 
-def clean_checkpoints(path_to_models='logs/44k/', n_ckpts_to_keep=2, sort_by_time=True):
+def clean_checkpoints(path_to_models='logs/48k/', n_ckpts_to_keep=2, sort_by_time=True):
   """Freeing up space by deleting saved ckpts
 
   Arguments:
@@ -226,30 +142,28 @@ def clean_checkpoints(path_to_models='logs/44k/', n_ckpts_to_keep=2, sort_by_tim
                         False -> lexicographically delete ckpts
   """
   ckpts_files = [f for f in os.listdir(path_to_models) if os.path.isfile(os.path.join(path_to_models, f))]
-  def name_key(_f):
-      return int(re.compile("._(\\d+)\\.pth").match(_f).group(1))
-  def time_key(_f):
-      return os.path.getmtime(os.path.join(path_to_models, _f))
+  name_key = (lambda _f: int(re.compile('._(\d+)\.pth').match(_f).group(1)))
+  time_key = (lambda _f: os.path.getmtime(os.path.join(path_to_models, _f)))
   sort_key = time_key if sort_by_time else name_key
-  def x_sorted(_x):
-      return sorted([f for f in ckpts_files if f.startswith(_x) and not f.endswith("_0.pth")], key=sort_key)
+  x_sorted = lambda _x: sorted([f for f in ckpts_files if f.startswith(_x) and not f.endswith('_0.pth')], key=sort_key)
   to_del = [os.path.join(path_to_models, fn) for fn in
             (x_sorted('G')[:-n_ckpts_to_keep] + x_sorted('D')[:-n_ckpts_to_keep])]
-  def del_info(fn):
-      return logger.info(f".. Free up space by deleting ckpt {fn}")
-  def del_routine(x):
-      return [os.remove(x), del_info(x)]
-  [del_routine(fn) for fn in to_del]
+  del_info = lambda fn: logger.info(f".. Free up space by deleting ckpt {fn}")
+  del_routine = lambda x: [os.remove(x), del_info(x)]
+  rs = [del_routine(fn) for fn in to_del]
 
 def summarize(writer, global_step, scalars={}, histograms={}, images={}, audios={}, audio_sampling_rate=22050):
-  for k, v in scalars.items():
-    writer.add_scalar(k, v, global_step)
-  for k, v in histograms.items():
-    writer.add_histogram(k, v, global_step)
-  for k, v in images.items():
-    writer.add_image(k, v, global_step, dataformats='HWC')
-  for k, v in audios.items():
-    writer.add_audio(k, v, global_step, audio_sampling_rate)
+  try:
+    for k, v in scalars.items():
+      writer.add_scalar(k, v, global_step)
+    for k, v in histograms.items():
+      writer.add_histogram(k, v, global_step)
+    for k, v in images.items():
+      writer.add_image(k, v, global_step, dataformats='HWC')
+    for k, v in audios.items():
+      writer.add_audio(k, v, global_step, audio_sampling_rate)
+  except Exception as e:
+    print(f"we dont care {e}")
 
 
 def latest_checkpoint_path(dir_path, regex="G_*.pth"):
@@ -278,12 +192,21 @@ def plot_spectrogram_to_numpy(spectrogram):
   plt.xlabel("Frames")
   plt.ylabel("Channels")
   plt.tight_layout()
-
-  fig.canvas.draw()
-  buf = fig.canvas.buffer_rgba()
-  data = np.asarray(buf)
-  plt.close()
-  return data[:,:,:3]
+  try:
+    fig.canvas.draw()
+    # 兼容新旧版本的matplotlib
+    if hasattr(fig.canvas, 'tostring_rgb'):
+      data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+    else:
+      # 新版本使用的方法
+      data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+      data = data.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:,:,:3]
+    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plt.close()
+    return data
+  except Exception as e:
+    print(f"we dont care {e}")
+    return None
 
 
 def plot_alignment_to_numpy(alignment, info=None):
@@ -309,7 +232,13 @@ def plot_alignment_to_numpy(alignment, info=None):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+  # 兼容新旧版本的matplotlib
+  if hasattr(fig.canvas, 'tostring_rgb'):
+    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+  else:
+    # 新版本使用的方法
+    data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    data = data.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:,:,:3]
   data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
   plt.close()
   return data
@@ -328,7 +257,7 @@ def load_filepaths_and_text(filename, split="|"):
 
 def get_hparams(init=True):
   parser = argparse.ArgumentParser()
-  parser.add_argument('-c', '--config', type=str, default="./configs/config.json",
+  parser.add_argument('-c', '--config', type=str, default="./configs/base.json",
                       help='JSON file for configuration')
   parser.add_argument('-m', '--model', type=str, required=True,
                       help='Model name')
@@ -367,11 +296,12 @@ def get_hparams_from_dir(model_dir):
   return hparams
 
 
-def get_hparams_from_file(config_path, infer_mode = False):
+def get_hparams_from_file(config_path):
   with open(config_path, "r") as f:
     data = f.read()
   config = json.loads(data)
-  hparams =HParams(**config) if not infer_mode else InferHParams(**config)
+
+  hparams =HParams(**config)
   return hparams
 
 
@@ -410,124 +340,6 @@ def get_logger(model_dir, filename="train.log"):
   return logger
 
 
-def repeat_expand_2d(content, target_len, mode = 'left'):
-    # content : [h, t]
-    return repeat_expand_2d_left(content, target_len) if mode == 'left' else repeat_expand_2d_other(content, target_len, mode)
-
-
-
-def repeat_expand_2d_left(content, target_len):
-    # content : [h, t]
-
-    src_len = content.shape[-1]
-    target = torch.zeros([content.shape[0], target_len], dtype=torch.float).to(content.device)
-    temp = torch.arange(src_len+1) * target_len / src_len
-    current_pos = 0
-    for i in range(target_len):
-        if i < temp[current_pos+1]:
-            target[:, i] = content[:, current_pos]
-        else:
-            current_pos += 1
-            target[:, i] = content[:, current_pos]
-
-    return target
-
-
-# mode : 'nearest'| 'linear'| 'bilinear'| 'bicubic'| 'trilinear'| 'area'
-def repeat_expand_2d_other(content, target_len, mode = 'nearest'):
-    # content : [h, t]
-    content = content[None,:,:]
-    target = F.interpolate(content,size=target_len,mode=mode)[0]
-    return target
-
-
-def mix_model(model_paths,mix_rate,mode):
-  mix_rate = torch.FloatTensor(mix_rate)/100
-  model_tem = torch.load(model_paths[0])
-  models = [torch.load(path)["model"] for path in model_paths]
-  if mode == 0:
-     mix_rate = F.softmax(mix_rate,dim=0)
-  for k in model_tem["model"].keys():
-     model_tem["model"][k] = torch.zeros_like(model_tem["model"][k])
-     for i,model in enumerate(models):
-        model_tem["model"][k] += model[k]*mix_rate[i]
-  torch.save(model_tem,os.path.join(os.path.curdir,"output.pth"))
-  return os.path.join(os.path.curdir,"output.pth")
-  
-def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出音频,rate是2的占比 from RVC
-    # print(data1.max(),data2.max())
-    rms1 = librosa.feature.rms(
-        y=data1, frame_length=sr1 // 2 * 2, hop_length=sr1 // 2
-    )  # 每半秒一个点
-    rms2 = librosa.feature.rms(y=data2.detach().cpu().numpy(), frame_length=sr2 // 2 * 2, hop_length=sr2 // 2)
-    rms1 = torch.from_numpy(rms1).to(data2.device)
-    rms1 = F.interpolate(
-        rms1.unsqueeze(0), size=data2.shape[0], mode="linear"
-    ).squeeze()
-    rms2 = torch.from_numpy(rms2).to(data2.device)
-    rms2 = F.interpolate(
-        rms2.unsqueeze(0), size=data2.shape[0], mode="linear"
-    ).squeeze()
-    rms2 = torch.max(rms2, torch.zeros_like(rms2) + 1e-6)
-    data2 *= (
-        torch.pow(rms1, torch.tensor(1 - rate))
-        * torch.pow(rms2, torch.tensor(rate - 1))
-    )
-    return data2
-
-def train_index(spk_name,root_dir = "dataset/44k/"):  #from: RVC https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
-    n_cpu = cpu_count()
-    print("The feature index is constructing.")
-    exp_dir = os.path.join(root_dir,spk_name)
-    listdir_res = []
-    for file in os.listdir(exp_dir):
-       if ".wav.soft.pt" in file:
-          listdir_res.append(os.path.join(exp_dir,file))
-    if len(listdir_res) == 0:
-        raise Exception("You need to run preprocess_hubert_f0.py!")
-    npys = []
-    for name in sorted(listdir_res):
-        phone = torch.load(name)[0].transpose(-1,-2).numpy()
-        npys.append(phone)
-    big_npy = np.concatenate(npys, 0)
-    big_npy_idx = np.arange(big_npy.shape[0])
-    np.random.shuffle(big_npy_idx)
-    big_npy = big_npy[big_npy_idx]
-    if big_npy.shape[0] > 2e5:
-        # if(1):
-        info = "Trying doing kmeans %s shape to 10k centers." % big_npy.shape[0]
-        print(info)
-        try:
-            big_npy = (
-                MiniBatchKMeans(
-                    n_clusters=10000,
-                    verbose=True,
-                    batch_size=256 * n_cpu,
-                    compute_labels=False,
-                    init="random",
-                )
-                .fit(big_npy)
-                .cluster_centers_
-            )
-        except Exception:
-            info = traceback.format_exc()
-            print(info)
-    n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
-    index = faiss.index_factory(big_npy.shape[1] , "IVF%s,Flat" % n_ivf)
-    index_ivf = faiss.extract_index_ivf(index)  #
-    index_ivf.nprobe = 1
-    index.train(big_npy)
-    batch_size_add = 8192
-    for i in range(0, big_npy.shape[0], batch_size_add):
-        index.add(big_npy[i : i + batch_size_add])
-    # faiss.write_index(
-    #     index,
-    #     f"added_{spk_name}.index"
-    # )
-    print("Successfully build index")
-    return index
-
-
 class HParams():
   def __init__(self, **kwargs):
     for k, v in kwargs.items():
@@ -559,31 +371,3 @@ class HParams():
   def __repr__(self):
     return self.__dict__.__repr__()
 
-  def get(self,index):
-    return self.__dict__.get(index)
-
-  
-class InferHParams(HParams):
-  def __init__(self, **kwargs):
-    for k, v in kwargs.items():
-      if type(v) == dict:
-        v = InferHParams(**v)
-      self[k] = v
-
-  def __getattr__(self,index):
-    return self.get(index)
-
-
-class Volume_Extractor:
-    def __init__(self, hop_size = 512):
-        self.hop_size = hop_size
-        
-    def extract(self, audio): # audio: 2d tensor array
-        if not isinstance(audio,torch.Tensor):
-           audio = torch.Tensor(audio)
-        n_frames = int(audio.size(-1) // self.hop_size)
-        audio2 = audio ** 2
-        audio2 = torch.nn.functional.pad(audio2, (int(self.hop_size // 2), int((self.hop_size + 1) // 2)), mode = 'reflect')
-        volume = torch.nn.functional.unfold(audio2[:,None,None,:],(1,self.hop_size),stride=self.hop_size)[:,:,:n_frames].mean(dim=1)[0]
-        volume = torch.sqrt(volume)
-        return volume

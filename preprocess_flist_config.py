@@ -1,119 +1,126 @@
-import argparse
-import json
 import os
+import argparse
 import re
-import wave
-from random import shuffle
 
-from loguru import logger
 from tqdm import tqdm
-
-import diffusion.logger.utils as du
+from random import shuffle
+import json
+config_template = {
+  "train": {
+    "log_interval": 200,
+    "eval_interval": 1000,
+    "seed": 1234,
+    "epochs": 10000,
+    "learning_rate": 1e-4,
+    "betas": [0.8, 0.99],
+    "eps": 1e-9,
+    "batch_size": 12,
+    "fp16_run": False,
+    "lr_decay": 0.999875,
+    "segment_size": 17920,
+    "init_lr_ratio": 1,
+    "warmup_epochs": 0,
+    "c_mel": 45,
+    "c_kl": 1.0,
+    "use_sr": True,
+    "max_speclen": 384,
+    "port": "8001",
+    "keep_ckpts": 5,  # Number of ckpts to keep, if 0, keep all
+  },
+  "data": {
+    "training_files":"filelists/train.txt",
+    "validation_files":"filelists/val.txt",
+    "max_wav_value": 32768.0,
+    "sampling_rate": 32000,
+    "filter_length": 1280,
+    "hop_length": 320,
+    "win_length": 1280,
+    "n_mel_channels": 80,
+    "mel_fmin": 0.0,
+    "mel_fmax": None
+  },
+  "model": {
+    "inter_channels": 192,
+    "hidden_channels": 192,
+    "filter_channels": 768,
+    "n_heads": 2,
+    "n_layers": 6,
+    "kernel_size": 3,
+    "p_dropout": 0.1,
+    "resblock": "1",
+    "resblock_kernel_sizes": [3,7,11],
+    "resblock_dilation_sizes": [[1,3,5], [1,3,5], [1,3,5]],
+    "upsample_rates": [10,8,2,2],
+    "upsample_initial_channel": 512,
+    "upsample_kernel_sizes": [16,16,4,4],
+    "n_layers_q": 3,
+    "use_spectral_norm": False,
+    "gin_channels": 256,
+    "ssl_dim": 256,
+    "n_speakers": 0,
+  },
+  "spk":{
+    "nen": 0,
+    "paimon": 1,
+    "yunhao": 2
+  }
+}
 
 pattern = re.compile(r'^[\.a-zA-Z0-9_\/]+$')
-
-def get_wav_duration(file_path):
-    try:
-        with wave.open(file_path, 'rb') as wav_file:
-            # 获取音频帧数
-            n_frames = wav_file.getnframes()
-            # 获取采样率
-            framerate = wav_file.getframerate()
-            # 计算时长（秒）
-            return n_frames / float(framerate)
-    except Exception as e:
-        logger.error(f"Reading {file_path}")
-        raise e
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_list", type=str, default="./filelists/train.txt", help="path to train list")
     parser.add_argument("--val_list", type=str, default="./filelists/val.txt", help="path to val list")
-    parser.add_argument("--source_dir", type=str, default="./dataset/44k", help="path to source dir")
-    parser.add_argument("--speech_encoder", type=str, default="vec768l12", help="choice a speech encoder|'vec768l12','vec256l9','hubertsoft','whisper-ppg','cnhubertlarge','dphubert','whisper-ppg-large','wavlmbase+'")
-    parser.add_argument("--vol_aug", action="store_true", help="Whether to use volume embedding and volume augmentation")
-    parser.add_argument("--tiny", action="store_true", help="Whether to train sovits tiny")
+    parser.add_argument("--test_list", type=str, default="./filelists/test.txt", help="path to test list")
+    parser.add_argument("--source_dir", type=str, default="./dataset/32k", help="path to source dir")
     args = parser.parse_args()
     
-    config_template =  json.load(open("configs_template/config_tiny_template.json")) if args.tiny else json.load(open("configs_template/config_template.json"))
     train = []
     val = []
+    test = []
     idx = 0
     spk_dict = {}
     spk_id = 0
-
     for speaker in tqdm(os.listdir(args.source_dir)):
         spk_dict[speaker] = spk_id
         spk_id += 1
-        wavs = []
-
-        for file_name in os.listdir(os.path.join(args.source_dir, speaker)):
-            if not file_name.endswith("wav"):
-                continue
-            if file_name.startswith("."):
-                continue
-
-            file_path = "/".join([args.source_dir, speaker, file_name])
-
-            if not pattern.match(file_name):
-                logger.warning("Detected non-ASCII file name: " + file_path)
-
-            if get_wav_duration(file_path) < 0.3:
-                logger.info("Skip too short audio: " + file_path)
-                continue
-
-            wavs.append(file_path)
-
+        wavs = ["/".join([args.source_dir, speaker, i]) for i in os.listdir(os.path.join(args.source_dir, speaker))]
+        for wavpath in wavs:
+            if not pattern.match(wavpath):
+                print(f"warning：文件名{wavpath}中包含非字母数字下划线，可能会导致错误。（也可能不会）")
+        if len(wavs) < 10:
+            print(f"warning：{speaker}数据集数量小于10条，请补充数据")
+        wavs = [i for i in wavs if i.endswith("wav")]
         shuffle(wavs)
-        train += wavs[2:]
+        train += wavs[2:-2]
         val += wavs[:2]
-
+        test += wavs[-2:]
+    n_speakers = len(spk_dict.keys())*2
     shuffle(train)
     shuffle(val)
-
-    logger.info("Writing " + args.train_list)
+    shuffle(test)
+            
+    print("Writing", args.train_list)
     with open(args.train_list, "w") as f:
         for fname in tqdm(train):
             wavpath = fname
             f.write(wavpath + "\n")
-
-    logger.info("Writing " + args.val_list)
+        
+    print("Writing", args.val_list)
     with open(args.val_list, "w") as f:
         for fname in tqdm(val):
             wavpath = fname
             f.write(wavpath + "\n")
+            
+    print("Writing", args.test_list)
+    with open(args.test_list, "w") as f:
+        for fname in tqdm(test):
+            wavpath = fname
+            f.write(wavpath + "\n")
 
-
-    d_config_template = du.load_config("configs_template/diffusion_template.yaml")
-    d_config_template["model"]["n_spk"] = spk_id
-    d_config_template["data"]["encoder"] = args.speech_encoder
-    d_config_template["spk"] = spk_dict
-    
+    config_template["model"]["n_speakers"] = n_speakers
     config_template["spk"] = spk_dict
-    config_template["model"]["n_speakers"] = spk_id
-    config_template["model"]["speech_encoder"] = args.speech_encoder
-    
-    if args.speech_encoder == "vec768l12" or args.speech_encoder == "dphubert" or args.speech_encoder == "wavlmbase+":
-        config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 768
-        d_config_template["data"]["encoder_out_channels"] = 768
-    elif args.speech_encoder == "vec256l9" or args.speech_encoder == 'hubertsoft':
-        config_template["model"]["ssl_dim"] = config_template["model"]["gin_channels"] = 256
-        d_config_template["data"]["encoder_out_channels"] = 256
-    elif args.speech_encoder == "whisper-ppg" or args.speech_encoder == 'cnhubertlarge':
-        config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 1024
-        d_config_template["data"]["encoder_out_channels"] = 1024
-    elif args.speech_encoder == "whisper-ppg-large":
-        config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 1280
-        d_config_template["data"]["encoder_out_channels"] = 1280
-        
-    if args.vol_aug:
-        config_template["train"]["vol_aug"] = config_template["model"]["vol_embedding"] = True
-
-    if args.tiny:
-        config_template["model"]["filter_channels"] = 512
-
-    logger.info("Writing to configs/config.json")
+    print("Writing configs/config.json")
     with open("configs/config.json", "w") as f:
         json.dump(config_template, f, indent=2)
-    logger.info("Writing to configs/diffusion.yaml")
-    du.save_config("configs/diffusion.yaml",d_config_template)

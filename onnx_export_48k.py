@@ -6,7 +6,7 @@ from onnxsim import simplify
 import onnxruntime as ort
 import onnxoptimizer
 import torch
-from model_onnx import SynthesizerTrn
+from model_onnx_48k import SynthesizerTrn
 import utils
 from hubert import hubert_model_onnx
 
@@ -16,7 +16,7 @@ def main(HubertExport,NetExport):
 
     if(HubertExport):
         device = torch.device("cuda")
-        hubert_soft = utils.get_hubert_model()
+        hubert_soft = hubert_model_onnx.hubert_soft("hubert/model.pt")
         test_input = torch.rand(1, 1, 16000)
         input_names = ["source"]
         output_names = ["embed"]
